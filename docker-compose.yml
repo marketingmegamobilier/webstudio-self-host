@@ -9,14 +9,21 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     volumes:
       - minio-data:/data
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    # Dokploy: puertos internos solo (expose), no se publican en el host.
+    # - 9000: S3 API → lo consume `app` vía S3_ENDPOINT (http://minio:9000).
+    # - 9001: MinIO Console → crea un dominio en Dokploy apuntando al puerto 9001
+    #         si necesitas acceder a la consola desde fuera.
+    expose:
+      - "9000"
+      - "9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - default
+      - webstudio-build-net
 
   # ── MinIO bucket init (runs once) ───────────────────────────────────────────
   minio-init:
@@ -37,6 +44,9 @@ services:
         mc mb --ignore-existing local/$$S3_BUCKET
         mc anonymous set download local/$$S3_BUCKET
         echo 'Bucket ready.'
+    networks:
+      - default
+      - webstudio-build-net
 
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
   db:
@@ -53,6 +63,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - default
+      - webstudio-build-net
 
   # ── PostgREST ───────────────────────────────────────────────────────────────
   postgrest:
@@ -68,6 +81,9 @@ services:
       PGRST_DB_ANON_ROLE: anon
       PGRST_JWT_SECRET: ${PGRST_JWT_SECRET}
       PGRST_DB_SCHEMAS: public
+    networks:
+      - default
+      - webstudio-build-net
 
   # ── PostgREST permissions (runs once after DB is ready) ─────────────────────
   # Grants the "anon" role access to all existing tables so PostgREST can query
@@ -91,6 +107,9 @@ services:
           -c "GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon;" \
           -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon;" \
           -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon;"
+    networks:
+      - default
+      - webstudio-build-net
 
   # ── Schema migrations ───────────────────────────────────────────────────────
   migrate:
@@ -107,10 +126,14 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/webstudio
       DIRECT_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/webstudio
+    networks:
+      - default
+      - webstudio-build-net
 
   # ── Self-hosted publisher ────────────────────────────────────────────────────
   # Port 4000 (internal): build API — receives publish requests from the builder.
-  # Port 4001 → host 80: site proxy — serves all published sites.
+  # Port 4001: site proxy — serves all published sites. En Dokploy NO se mapea al
+  #   host 80; se enruta vía dominio de Dokploy hacia este puerto (ver expose).
   #   SSR domains → reverse-proxied to their react-router-serve subprocess
   #   SSG domains → static files served directly from /var/publish/<domain>/
   publisher:
@@ -119,13 +142,25 @@ services:
     depends_on:
       app:
         condition: service_healthy
-    ports:
-      - "80:4001"
+    # Dokploy: el host 80/443 ya lo gestiona el Traefik de Dokploy, así que NO
+    # publicamos puertos. Exponemos solo el 4001 (site proxy) para que Dokploy
+    # enrute hacia aquí. IMPORTANTE:
+    #   - Crea en Dokploy un dominio (ej. tu dominio de publicación) apuntando
+    #     al puerto 4001 de este servicio.
+    #   - Para los sitios publicados con dominios propios (SSR/SSG) necesitarás
+    #     un dominio wildcard (*.tu-dominio) también apuntando a 4001, ya que el
+    #     publisher despacha por Host todos los sitios publicados.
+    expose:
+      - "4001"
     environment:
       TRPC_SERVER_API_TOKEN: ${TRPC_SERVER_API_TOKEN}
       PUBLISHER_HOST: ${PUBLISHER_HOST:-}
       BUILDER_INTERNAL_URL: http://app:3000
       PROXY_PORT: "4001"
+      # Dokploy/SSR: red donde el publisher conecta los contenedores de build de
+      # SSR para que alcancen el build API (publisher:4000) y al builder (app:3000).
+      # Debe coincidir con el 'name:' de la red definida abajo.
+      DOCKER_NETWORK: webstudio-build-net
       # Optional: set to your Traefik file-provider directory to enable auto-generation
       # of per-domain route configs for custom domains (with TLS via Let's Encrypt).
       # Example: TRAEFIK_DYNAMIC_DIR=/etc/traefik/dynamic
@@ -134,11 +169,19 @@ services:
     volumes:
       - published-sites:/var/publish
       - publisher-work:/var/work
+      # Dokploy/SSR: el publisher levanta contenedores de build; necesita acceso
+      # al daemon de Docker del host. Sin esto, buildMode 'ssr' no funciona.
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
+    # En la 'default' (comunicación normal con app/db/minio) + 'webstudio-net'
+    # (nombre fijo para que los contenedores de build SSR alcancen este servicio).
+    networks:
+      - default
+      - webstudio-build-net
 
   # ── Webstudio builder ───────────────────────────────────────────────────────
   app:
@@ -149,8 +192,8 @@ services:
         condition: service_completed_successfully
       minio-init:
         condition: service_completed_successfully
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health || exit 1"]
       interval: 30s
@@ -189,6 +232,22 @@ services:
       SELF_HOSTED_PUBLISHER_URL: ${SELF_HOSTED_PUBLISHER_URL:-http://publisher:4000}
     volumes:
       - uploads:/app/public/s/uploads
+    # En la 'default' (comunicación con db/postgrest/minio) + 'webstudio-net'
+    # (para que los contenedores de build SSR creados por el publisher lo alcancen).
+    networks:
+      - default
+      - webstudio-build-net
+
+networks:
+  # En Dokploy la red 'default' implícita NO resuelve nombres entre servicios
+  # (por eso postgrest/app no encontraban 'db' → error 500 "Invariant failed").
+  # Solución: TODOS los servicios se conectan ADEMÁS a 'webstudio-build-net'
+  # (red explícita con nombre fijo), que SÍ proporciona DNS. Mantenemos 'default'
+  # por compatibilidad con el enrutamiento de Dokploy.
+  # DOCKER_NETWORK apunta aquí para que los contenedores de build SSR alcancen
+  # también a db/postgrest/publisher/app.
+  webstudio-build-net:
+    name: webstudio-build-net
 
 volumes:
   db-data:
